@@ -1,27 +1,30 @@
-from pathlib import Path
-
-script = r'''#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-biotech_screener_v1.py
+biotech_screener_v1_clean.py
 
 Excel-first biotech screener MVP.
 
+What it does
+------------
+1) Builds a public-company universe from SEC ticker data.
+2) Pulls SEC submissions metadata and XBRL company facts.
+3) Pulls ClinicalTrials.gov study data by sponsor/company name.
+4) Optionally pulls FDA Drugs@FDA approval/application data by sponsor name.
+5) Writes a real .xlsx workbook.
 
-Notes
------
-- This script is intentionally transparent and hackable.
-- ClinicalTrials.gov sponsor matching is the noisiest join. A manual alias file is supported.
-- SEC is used as the master public-company identity source.
-- For ClinicalTrials.gov, this MVP uses the legacy query endpoint because ClinicalTrials.gov
-  states in its migration materials that legacy endpoints continue to be supported while users
-  transition to the v2 API.
+Sheets written
+--------------
+- CompanySummary
+- Universe
+- TrialsRaw
+- FDARaw
+- Unmatched
+- Errors
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import math
 import re
 import sys
 import time
@@ -31,7 +34,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from zipfile import ZipFile
 
 import requests
@@ -39,21 +42,14 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
-# -----------------------------
-# Configuration
-# -----------------------------
-
 SEC_TICKERS_EXCHANGE_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-
-# Legacy endpoint retained for MVP stability. Easy to swap later if you want to move fully to v2.
 CTG_LEGACY_STUDY_FIELDS_URL = "https://clinicaltrials.gov/api/query/study_fields"
-
 DRUGS_FDA_ZIP_URL = "https://www.fda.gov/media/89850/download"
 
 DEFAULT_HEADERS = {
-    "User-Agent": "FerdiBiotechScreener/0.1 (educational research tool; contact: replace-with-your-email@example.com)",
+    "User-Agent": "FerdiBiotechScreener/0.1 (educational research tool; replace-with-your-email@example.com)",
     "Accept": "application/json, text/plain, */*",
 }
 
@@ -64,28 +60,22 @@ BIOTECH_KEYWORDS = [
     "precision medicine", "antibody", "rna", "mrna", "crispr", "small molecule",
 ]
 
-# Fast first-pass name heuristics. You can expand these over time.
 NAME_STOPWORDS = {
-    "inc", "inc.", "corp", "corp.", "corporation", "company", "co", "co.", "holdings",
-    "holding", "group", "ltd", "ltd.", "limited", "plc", "ag", "sa", "nv", "se",
-    "the", "biosciences", "bioscience", "biologics"
+    "inc", "inc.", "corp", "corp.", "corporation", "company", "co", "co.",
+    "holdings", "holding", "group", "ltd", "ltd.", "limited", "plc", "ag",
+    "sa", "nv", "se", "the", "biosciences", "bioscience", "biologics"
 }
 
-# XBRL concept candidates in priority order.
 XBRL_CASH_TAGS = [
     ("us-gaap", "CashAndCashEquivalentsAtCarryingValue"),
     ("us-gaap", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"),
 ]
-XBRL_ASSET_TAGS = [
-    ("us-gaap", "Assets"),
-]
+XBRL_ASSET_TAGS = [("us-gaap", "Assets")]
 XBRL_OCF_TAGS = [
     ("us-gaap", "NetCashProvidedByUsedInOperatingActivities"),
     ("us-gaap", "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"),
 ]
-XBRL_NET_INCOME_TAGS = [
-    ("us-gaap", "NetIncomeLoss"),
-]
+XBRL_NET_INCOME_TAGS = [("us-gaap", "NetIncomeLoss")]
 
 PHASE_ORDER = {
     "EARLY_PHASE1": 1,
@@ -116,9 +106,6 @@ RAW_TRIAL_FIELDS = [
     "LastUpdatePostDate",
 ]
 
-# -----------------------------
-# Data classes
-# -----------------------------
 
 @dataclass
 class Company:
@@ -132,6 +119,7 @@ class Company:
     biotech_flag: bool = False
     biotech_reason: str = ""
     facts: Dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
 class TrialRecord:
@@ -152,6 +140,7 @@ class TrialRecord:
     study_first_submit_date: str = ""
     last_update_post_date: str = ""
 
+
 @dataclass
 class FDARow:
     ticker: str
@@ -166,15 +155,10 @@ class FDARow:
     active_ingredient: str = ""
     marketing_status: str = ""
 
-# -----------------------------
-# Helpers
-# -----------------------------
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
-def today_iso() -> str:
-    return date.today().isoformat()
 
 def parse_date_safe(value: Any) -> Optional[date]:
     if value is None:
@@ -182,19 +166,29 @@ def parse_date_safe(value: Any) -> Optional[date]:
     s = str(value).strip()
     if not s:
         return None
+
     for fmt in ("%Y-%m-%d", "%Y-%m", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y"):
         try:
-            dt = datetime.strptime(s[:len(fmt)], fmt)
             if fmt == "%Y-%m":
+                dt = datetime.strptime(s[:7], fmt)
                 return date(dt.year, dt.month, 1)
-            return dt.date()
+            if fmt == "%Y-%m-%d":
+                dt = datetime.strptime(s[:10], fmt)
+                return dt.date()
+            if fmt == "%Y-%m-%d %H:%M:%S":
+                dt = datetime.strptime(s[:19], fmt)
+                return dt.date()
+            if fmt == "%m/%d/%Y":
+                dt = datetime.strptime(s[:10], fmt)
+                return dt.date()
         except Exception:
             pass
-    # Try a relaxed ISO parse.
+
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
     except Exception:
         return None
+
 
 def days_until(value: Any) -> Optional[int]:
     d = parse_date_safe(value)
@@ -202,12 +196,14 @@ def days_until(value: Any) -> Optional[int]:
         return None
     return (d - date.today()).days
 
+
 def normalize_name(name: str) -> str:
     s = (name or "").lower()
     s = re.sub(r"[^a-z0-9\s&-]", " ", s)
     tokens = [t for t in re.split(r"\s+", s) if t]
     tokens = [t for t in tokens if t not in NAME_STOPWORDS]
     return " ".join(tokens).strip()
+
 
 def possible_aliases(company_name: str) -> List[str]:
     raw = company_name.strip()
@@ -222,6 +218,7 @@ def possible_aliases(company_name: str) -> List[str]:
             aliases.add(tokens[0])
     return [a for a in aliases if a]
 
+
 def safe_float(x: Any) -> Optional[float]:
     try:
         if x is None or x == "":
@@ -230,13 +227,13 @@ def safe_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
-def latest_fact_value(facts_json: Dict[str, Any], taxonomy: str, tag: str, unit_preference: Optional[str] = None) -> Tuple[Optional[float], Optional[str], Optional[str]]:
-    """
-    Returns: (value, end_date, form)
-    Preference:
-    - USD for duration or instant measures when available
-    - newest end date
-    """
+
+def latest_fact_value(
+    facts_json: Dict[str, Any],
+    taxonomy: str,
+    tag: str,
+    unit_preference: Optional[str] = None,
+) -> Tuple[Optional[float], Optional[str], Optional[str]]:
     facts = facts_json.get("facts", {}).get(taxonomy, {}).get(tag, {})
     units = facts.get("units", {})
     if not units:
@@ -255,78 +252,102 @@ def latest_fact_value(facts_json: Dict[str, Any], taxonomy: str, tag: str, unit_
             fp = item.get("fp")
             if val is None or not end:
                 continue
-            candidates.append((parse_date_safe(end), val, end, form, fy, fp))
-    candidates = [c for c in candidates if c[0] is not None]
+            parsed = parse_date_safe(end)
+            if parsed is None:
+                continue
+            candidates.append((parsed, val, end, form, fy, fp))
+
     if not candidates:
         return None, None, None
+
     candidates.sort(key=lambda x: x[0], reverse=True)
     _, val, end, form, _, _ = candidates[0]
     return val, end, form
 
-def first_available_fact(facts_json: Dict[str, Any], choices: List[Tuple[str, str]], unit_preference: Optional[str] = "USD") -> Tuple[Optional[float], Optional[str], Optional[str], Optional[str]]:
+
+def first_available_fact(
+    facts_json: Dict[str, Any],
+    choices: List[Tuple[str, str]],
+    unit_preference: Optional[str] = "USD",
+) -> Tuple[Optional[float], Optional[str], Optional[str], Optional[str]]:
     for taxonomy, tag in choices:
         val, end, form = latest_fact_value(facts_json, taxonomy, tag, unit_preference=unit_preference)
         if val is not None:
             return val, end, form, f"{taxonomy}:{tag}"
     return None, None, None, None
 
-def request_json(url: str, session: requests.Session, params: Optional[Dict[str, Any]] = None, sleep_sec: float = 0.15) -> Dict[str, Any]:
+
+def request_json(
+    url: str,
+    session: requests.Session,
+    params: Optional[Dict[str, Any]] = None,
+    sleep_sec: float = 0.15,
+) -> Dict[str, Any]:
     r = session.get(url, params=params, timeout=60)
     r.raise_for_status()
     time.sleep(sleep_sec)
     return r.json()
+
 
 def request_bytes(url: str, session: requests.Session) -> bytes:
     r = session.get(url, timeout=120)
     r.raise_for_status()
     return r.content
 
-# -----------------------------
-# SEC universe and financials
-# -----------------------------
 
 def load_sec_ticker_universe(session: requests.Session) -> List[Company]:
     data = request_json(SEC_TICKERS_EXCHANGE_URL, session)
     companies: List[Company] = []
 
-    if isinstance(data, dict) and "data" in data:
-        rows = data["data"]
-        fields = data.get("fields", [])
-        idx = {name: i for i, name in enumerate(fields)}
-        for row in rows:
-            try:
-                ticker = str(row[idx.get("ticker")]).strip()
-                cik_raw = str(row[idx.get("cik")]).strip()
-                company_name = str(row[idx.get("name")]).strip()
-                exchange = str(row[idx.get("exchange")]).strip() if "exchange" in idx else ""
-            except Exception:
-                continue
-            if not ticker or not cik_raw or not company_name:
-                continue
-            companies.append(
-                Company(
-                    ticker=ticker.upper(),
-                    cik=str(cik_raw).zfill(10),
-                    company_name=company_name,
-                    exchange=exchange,
-                    aliases=possible_aliases(company_name),
-                )
-            )
-    else:
+    if not (isinstance(data, dict) and "data" in data):
         raise ValueError("Unexpected SEC tickers payload format")
 
+    rows = data["data"]
+    fields = data.get("fields", [])
+    idx = {name: i for i, name in enumerate(fields)}
+
+    for row in rows:
+        try:
+            ticker = str(row[idx["ticker"]]).strip()
+            cik_raw = str(row[idx["cik"]]).strip()
+            company_name = str(row[idx["name"]]).strip()
+            exchange = str(row[idx["exchange"]]).strip() if "exchange" in idx else ""
+        except Exception:
+            continue
+
+        if not ticker or not cik_raw or not company_name:
+            continue
+
+        companies.append(
+            Company(
+                ticker=ticker.upper(),
+                cik=str(cik_raw).zfill(10),
+                company_name=company_name,
+                exchange=exchange,
+                aliases=possible_aliases(company_name),
+            )
+        )
+
     return companies
+
 
 def enrich_submissions_metadata(company: Company, session: requests.Session) -> None:
     data = request_json(SEC_SUBMISSIONS_URL.format(cik=company.cik), session)
     company.sic = str(data.get("sic", "") or "")
     company.sic_description = str(data.get("sicDescription", "") or "")
-    # Basic biotech flagging.
+
+    former_names = data.get("formerNames") or []
+    former_name_text = " ".join(
+        item.get("name", "") if isinstance(item, dict) else str(item)
+        for item in former_names
+    )
+
     haystack = " ".join([
         company.company_name,
         company.sic_description,
-        " ".join((data.get("formerNames") or [])) if isinstance(data.get("formerNames"), list) else "",
+        former_name_text,
     ]).lower()
+
     matched = [kw for kw in BIOTECH_KEYWORDS if kw in haystack]
     if matched:
         company.biotech_flag = True
@@ -334,6 +355,7 @@ def enrich_submissions_metadata(company: Company, session: requests.Session) -> 
     elif company.sic_description and any(x in company.sic_description.lower() for x in ["pharmaceutical", "biological", "medical", "drug"]):
         company.biotech_flag = True
         company.biotech_reason = "sic_description"
+
 
 def load_companyfacts(company: Company, session: requests.Session) -> None:
     facts_json = request_json(SEC_COMPANYFACTS_URL.format(cik=company.cik), session)
@@ -373,9 +395,6 @@ def load_companyfacts(company: Company, session: requests.Session) -> None:
         "estimated_runway_months": runway_months,
     }
 
-# -----------------------------
-# ClinicalTrials.gov
-# -----------------------------
 
 def ctg_fetch_studies_for_sponsor(
     sponsor_query: str,
@@ -420,15 +439,18 @@ def ctg_fetch_studies_for_sponsor(
                 last_update_post_date=first("LastUpdatePostDate"),
             )
         )
+
     return out
 
-def choose_best_alias_trial_match(company: Company, session: requests.Session, max_trials_per_alias: int) -> Tuple[str, List[TrialRecord]]:
-    """
-    Tries multiple aliases and chooses the one with the highest number of returned studies.
-    This is crude, but transparent and practical for v1.
-    """
+
+def choose_best_alias_trial_match(
+    company: Company,
+    session: requests.Session,
+    max_trials_per_alias: int,
+) -> Tuple[str, List[TrialRecord]]:
     best_alias = company.company_name
     best_trials: List[TrialRecord] = []
+
     for alias in company.aliases:
         try:
             trials = ctg_fetch_studies_for_sponsor(alias, session, max_rank=max_trials_per_alias)
@@ -437,14 +459,13 @@ def choose_best_alias_trial_match(company: Company, session: requests.Session, m
         if len(trials) > len(best_trials):
             best_alias = alias
             best_trials = trials
+
     for t in best_trials:
         t.ticker = company.ticker
         t.company_name = company.company_name
+
     return best_alias, best_trials
 
-# -----------------------------
-# FDA Drugs@FDA
-# -----------------------------
 
 def load_drugsfda_tables(session: requests.Session) -> Dict[str, List[Dict[str, str]]]:
     blob = request_bytes(DRUGS_FDA_ZIP_URL, session)
@@ -478,37 +499,39 @@ def load_drugsfda_tables(session: requests.Session) -> Dict[str, List[Dict[str, 
 
     return tables
 
+
 def sponsor_matches(company: Company, sponsor_name: str) -> bool:
     a = normalize_name(company.company_name)
     b = normalize_name(sponsor_name)
     if not a or not b:
         return False
-    if a == b:
+    if a == b or a in b or b in a:
         return True
-    if a in b or b in a:
-        return True
-    # token overlap heuristic
     a_set = set(a.split())
     b_set = set(b.split())
     overlap = len(a_set & b_set)
     return overlap >= 2 or (overlap >= 1 and min(len(a_set), len(b_set)) == 1)
+
 
 def build_fda_rows_for_company(company: Company, fda_tables: Dict[str, List[Dict[str, str]]]) -> List[FDARow]:
     apps = fda_tables.get("applications", [])
     prods = fda_tables.get("products", [])
     subs = fda_tables.get("submissions", [])
     mstats = fda_tables.get("marketing_status", [])
-    mlookup = {row.get("MarketingStatusID", ""): row.get("MarketingStatusDescription", "") for row in fda_tables.get("marketing_status_lookup", [])}
+    mlookup = {
+        row.get("MarketingStatusID", ""): row.get("MarketingStatusDescription", "")
+        for row in fda_tables.get("marketing_status_lookup", [])
+    }
 
-    products_by_appl = {}
+    products_by_appl: Dict[str, List[Dict[str, str]]] = {}
     for p in prods:
         products_by_appl.setdefault(p.get("ApplNo", ""), []).append(p)
 
-    submissions_by_appl = {}
+    submissions_by_appl: Dict[str, List[Dict[str, str]]] = {}
     for s in subs:
         submissions_by_appl.setdefault(s.get("ApplNo", ""), []).append(s)
 
-    marketing_by_key = {}
+    marketing_by_key: Dict[Tuple[str, str], str] = {}
     for m in mstats:
         marketing_by_key[(m.get("ApplNo", ""), m.get("ProductNo", ""))] = mlookup.get(m.get("MarketingStatusID", ""), "")
 
@@ -551,13 +574,11 @@ def build_fda_rows_for_company(company: Company, fda_tables: Dict[str, List[Dict
 
     return rows
 
-# -----------------------------
-# Summaries for A / B / C / D
-# -----------------------------
 
 def phase_rank_value(phase_text: str) -> int:
     raw = (phase_text or "").upper().replace(" ", "")
     return PHASE_ORDER.get(raw, 0)
+
 
 def summarize_trials(trials: List[TrialRecord]) -> Dict[str, Any]:
     if not trials:
@@ -596,13 +617,16 @@ def summarize_trials(trials: List[TrialRecord]) -> Dict[str, Any]:
                 item = item.strip()
                 if item:
                     unique_assets.add(item)
+
         if t.condition:
             for cond in t.condition.split(";"):
                 cond = cond.strip()
                 if cond:
                     indication_counter[cond] += 1
+
         if t.lead_sponsor_name:
             lead_sponsors.add(t.lead_sponsor_name)
+
         if t.collaborator_name:
             for collab in t.collaborator_name.split(";"):
                 collab = collab.strip()
@@ -626,10 +650,7 @@ def summarize_trials(trials: List[TrialRecord]) -> Dict[str, Any]:
         if dc is not None and dc >= 0:
             completion_days.append(dc)
 
-    highest_phase = ""
-    if phase_counter:
-        highest_phase = max(phase_counter.keys(), key=phase_rank_value)
-
+    highest_phase = max(phase_counter.keys(), key=phase_rank_value) if phase_counter else ""
     top_indications = ", ".join([k for k, _ in indication_counter.most_common(5)])
     phase_distribution = "; ".join([f"{k}:{v}" for k, v in phase_counter.most_common()])
 
@@ -655,6 +676,7 @@ def summarize_trials(trials: List[TrialRecord]) -> Dict[str, Any]:
         "single_indication_flag": len(indication_counter) <= 1,
     }
 
+
 def summarize_fda(rows: List[FDARow]) -> Dict[str, Any]:
     if not rows:
         return {
@@ -662,17 +684,19 @@ def summarize_fda(rows: List[FDARow]) -> Dict[str, Any]:
             "fda_latest_submission_date": "",
             "fda_products_top5": "",
         }
+
     products = [r.drug_name for r in rows if r.drug_name]
-    latest_date = max((parse_date_safe(r.submission_status_date) for r in rows if r.submission_status_date), default=None)
+    latest_date = max(
+        (parse_date_safe(r.submission_status_date) for r in rows if r.submission_status_date),
+        default=None,
+    )
+
     return {
         "approved_products_count": len(set(products)),
         "fda_latest_submission_date": latest_date.isoformat() if latest_date else "",
         "fda_products_top5": ", ".join(list(dict.fromkeys(products))[:5]),
     }
 
-# -----------------------------
-# Excel writing
-# -----------------------------
 
 def autosize_worksheet(ws, max_width: int = 50) -> None:
     for col in ws.columns:
@@ -685,6 +709,7 @@ def autosize_worksheet(ws, max_width: int = 50) -> None:
             except Exception:
                 pass
         ws.column_dimensions[letter].width = min(max(10, max_len + 2), max_width)
+
 
 def write_sheet(ws, rows: List[Dict[str, Any]], title_bold: bool = True) -> None:
     if not rows:
@@ -699,17 +724,8 @@ def write_sheet(ws, rows: List[Dict[str, Any]], title_bold: bool = True) -> None
         ws.append([row.get(h, "") for h in headers])
     autosize_worksheet(ws)
 
-# -----------------------------
-# Main pipeline
-# -----------------------------
 
 def load_alias_overrides(path: Optional[Path]) -> Dict[str, List[str]]:
-    """
-    CSV format:
-    ticker,alias
-    ABCD,Acme Therapeutics
-    ABCD,Acme Bio
-    """
     out: Dict[str, List[str]] = {}
     if not path or not path.exists():
         return out
@@ -724,6 +740,7 @@ def load_alias_overrides(path: Optional[Path]) -> Dict[str, List[str]]:
         out.setdefault(parts[0].upper(), []).append(parts[1])
     return out
 
+
 def run(args: argparse.Namespace) -> None:
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
@@ -737,7 +754,6 @@ def run(args: argparse.Namespace) -> None:
     universe = load_sec_ticker_universe(session)
     log(f"Loaded {len(universe):,} SEC tickers.")
 
-    # First-pass subset. For a first run, keep this reasonably small if you want speed.
     if args.tickers:
         wanted = {x.strip().upper() for x in args.tickers.split(",") if x.strip()}
         universe = [c for c in universe if c.ticker in wanted]
@@ -770,8 +786,7 @@ def run(args: argparse.Namespace) -> None:
     universe = filtered
     log(f"Universe after filter: {len(universe):,}")
 
-    # FDA is loaded once.
-    fda_tables = {}
+    fda_tables: Dict[str, List[Dict[str, str]]] = {}
     if args.include_fda:
         try:
             log("Loading Drugs@FDA tables...")
@@ -848,7 +863,6 @@ def run(args: argparse.Namespace) -> None:
             "ticker": company.ticker,
             "company_name": company.company_name,
             "matched_sponsor_alias": matched_alias,
-            # A
             "study_count": trial_summary["study_count"],
             "unique_assets": trial_summary["unique_assets"],
             "highest_phase": trial_summary["highest_phase"],
@@ -856,14 +870,12 @@ def run(args: argparse.Namespace) -> None:
             "key_indications_top5": trial_summary["key_indications_top5"],
             "lead_sponsor_count": trial_summary["lead_sponsor_count"],
             "collaborator_count": trial_summary["collaborator_count"],
-            # B
             "next_primary_completion_days": trial_summary["next_primary_completion_days"],
             "next_completion_days": trial_summary["next_completion_days"],
             "catalysts_3m": trial_summary["catalysts_3m"],
             "catalysts_6m": trial_summary["catalysts_6m"],
             "catalysts_12m": trial_summary["catalysts_12m"],
             "late_stage_trials": trial_summary["late_stage_trials"],
-            # C
             "cash": facts.get("cash"),
             "cash_end": facts.get("cash_end"),
             "cash_form": facts.get("cash_form"),
@@ -876,7 +888,6 @@ def run(args: argparse.Namespace) -> None:
             "net_income_end": facts.get("net_income_end"),
             "estimated_annual_burn": facts.get("estimated_annual_burn"),
             "estimated_runway_months": facts.get("estimated_runway_months"),
-            # D
             "terminated_withdrawn_suspended": trial_summary["terminated_withdrawn_suspended"],
             "single_asset_flag": trial_summary["single_asset_flag"],
             "single_indication_flag": trial_summary["single_indication_flag"],
@@ -949,16 +960,18 @@ def run(args: argparse.Namespace) -> None:
     wb.save(out_path)
     log(f"Saved workbook: {out_path}")
 
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Excel-first biotech screener MVP.")
     p.add_argument("--output", default="data/biotech_screener_v1.xlsx", help="Output .xlsx path")
     p.add_argument("--tickers", default="", help="Comma-separated ticker whitelist, e.g. MRNA,CRSP,VRTX")
-    p.add_argument("--limit", type=int, default=0, help="Limit the SEC universe before filtering (useful for testing)")
+    p.add_argument("--limit", type=int, default=0, help="Limit the SEC universe before filtering")
     p.add_argument("--only-biotech", action="store_true", help="Keep only companies that pass the biotech heuristic")
     p.add_argument("--max-trials-per-alias", type=int, default=100, help="Max CT.gov trials to fetch per alias")
     p.add_argument("--include-fda", action="store_true", help="Include Drugs@FDA sponsor matching")
     p.add_argument("--alias-overrides", default="", help="CSV file with manual ticker->alias overrides")
     return p
+
 
 if __name__ == "__main__":
     parser = build_parser()
@@ -970,19 +983,3 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
         sys.exit(1)
-'''
-
-readme = r'''# Biotech Screener MVP
-
-This starter script writes a real Excel workbook (`.xlsx`) with:
-- `CompanySummary`
-- `Universe`
-- `TrialsRaw`
-- `FDARaw`
-- `Unmatched`
-- `Errors`
-
-## Example usage
-
-```bash
-python biotech_screener_v1.py --tickers MRNA,CRSP,VRTX --include-fda --output data/biotech_test.xlsx
