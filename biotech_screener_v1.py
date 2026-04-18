@@ -436,7 +436,7 @@ def load_companyfacts(company: Company, session: requests.Session) -> None:
     if cash is not None and burn_annual and burn_annual > 0:
         runway_months = (cash / burn_annual) * 12.0
 
-    company.facts = {
+    company.facts.update({
         "cash": cash,
         "cash_end": cash_end,
         "cash_form": cash_form,
@@ -455,7 +455,7 @@ def load_companyfacts(company: Company, session: requests.Session) -> None:
         "net_income_tag": ni_tag,
         "estimated_annual_burn": burn_annual,
         "estimated_runway_months": runway_months,
-    }
+})
 
 
 def ctg_fetch_studies_for_sponsor(
@@ -506,36 +506,6 @@ def ctg_fetch_studies_for_sponsor(
 
     return out
 
-    study_fields = data.get("StudyFieldsResponse", {}).get("StudyFields", [])
-    for row in study_fields:
-        def first(field: str) -> str:
-            v = row.get(field, [])
-            if isinstance(v, list):
-                return "; ".join(str(x) for x in v if x is not None)
-            return str(v or "")
-
-        out.append(
-            TrialRecord(
-                ticker="",
-                company_name="",
-                sponsor_query=sponsor_query,
-                nct_id=first("NCTId"),
-                brief_title=first("BriefTitle"),
-                condition=first("Condition"),
-                intervention_name=first("InterventionName"),
-                intervention_type=first("InterventionType"),
-                lead_sponsor_name=first("LeadSponsorName"),
-                collaborator_name=first("CollaboratorName"),
-                phase=first("Phase"),
-                overall_status=first("OverallStatus"),
-                primary_completion_date=first("PrimaryCompletionDate"),
-                completion_date=first("CompletionDate"),
-                study_first_submit_date=first("StudyFirstSubmitDate"),
-                last_update_post_date=first("LastUpdatePostDate"),
-            )
-        )
-
-    return out
 
 def token_set(text: str) -> set[str]:
     return {t for t in normalize_name(text).split() if t}
@@ -1128,12 +1098,11 @@ def run(args: argparse.Namespace) -> None:
     log(f"Saved workbook: {out_path}")
 
 
-def build_parser()() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Excel-first biotech screener MVP.")
     p.add_argument("--output", default="data/biotech_screener_v1.xlsx", help="Output .xlsx path")
     p.add_argument("--tickers", default="", help="Comma-separated ticker whitelist, e.g. MRNA,CRSP,VRTX")
     p.add_argument("--limit", type=int, default=0, help="Limit the SEC universe before filtering")
-    p.add_argument("--only-biotech", action="store_true", help="Keep only companies that pass the biotech heuristic")
     p.add_argument("--max-trials-per-alias", type=int, default=100, help="Max CT.gov trials to fetch per alias")
     p.add_argument("--include-fda", action="store_true", help="Include Drugs@FDA sponsor matching")
     p.add_argument("--alias-overrides", default="", help="CSV file with manual ticker->alias overrides")
