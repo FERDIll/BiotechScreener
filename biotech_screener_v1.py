@@ -49,7 +49,7 @@ CTG_LEGACY_STUDY_FIELDS_URL = "https://clinicaltrials.gov/api/query/study_fields
 DRUGS_FDA_ZIP_URL = "https://www.fda.gov/media/89850/download"
 
 DEFAULT_HEADERS = {
-    "User-Agent": "FerdiBiotechScreener/0.1 (educational research tool; replace-with-your-email@example.com)",
+    "User-Agent": "FerdiBiotechScreener/0.1 (educational research tool; fepexa6691@mypethealh.com)",
     "Accept": "application/json, text/plain, */*",
 }
 
