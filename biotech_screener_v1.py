@@ -208,15 +208,51 @@ def normalize_name(name: str) -> str:
 def possible_aliases(company_name: str) -> List[str]:
     raw = company_name.strip()
     norm = normalize_name(raw)
+
     aliases = {raw}
     if norm:
         aliases.add(norm)
-        tokens = norm.split()
+
+    # remove common legal suffixes and location fragments
+    cleaned = re.sub(r"\s*/\s*[A-Z]{2,3}$", "", raw).strip()
+    cleaned = re.sub(
+        r"\b(incorporated|inc\.?|corp\.?|corporation|company|co\.?|ltd\.?|limited|plc|ag|sa|nv|se)\b",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,/")
+    if cleaned:
+        aliases.add(cleaned)
+        aliases.add(cleaned.lower())
+
+    norm_clean = normalize_name(cleaned)
+    if norm_clean:
+        aliases.add(norm_clean)
+
+        tokens = norm_clean.split()
         if len(tokens) >= 2:
             aliases.add(" ".join(tokens[:2]))
+        if len(tokens) >= 3:
+            aliases.add(" ".join(tokens[:3]))
         if len(tokens) >= 1:
             aliases.add(tokens[0])
-    return [a for a in aliases if a]
+
+    # a few manual-style biotech friendly variants
+    if "pharmaceuticals" in norm:
+        aliases.add(norm.replace("pharmaceuticals", "").strip())
+        aliases.add(norm.replace("pharmaceuticals", "pharma").strip())
+    if "therapeutics" in norm:
+        aliases.add(norm.replace("therapeutics", "").strip())
+    if "moderna inc" in norm or "moderna" in norm:
+        aliases.add("ModernaTX")
+        aliases.add("ModernaTX, Inc.")
+    if "vertex pharmaceuticals" in norm:
+        aliases.add("Vertex Pharmaceuticals Incorporated")
+    if "crispr therapeutics" in norm:
+        aliases.add("CRISPR Therapeutics")
+
+    return [a for a in sorted(aliases, key=len, reverse=True) if a]
 
 
 def safe_float(x: Any) -> Optional[float]:
@@ -427,13 +463,15 @@ def ctg_fetch_studies_for_sponsor(
     session: requests.Session,
     max_rank: int = 100,
 ) -> List[TrialRecord]:
+    # Broad search first; we will post-filter in Python.
     params = {
-        "expr": f'SPONSOR="{sponsor_query}" OR LEADSPONSOR="{sponsor_query}"',
+        "expr": sponsor_query,
         "fields": ",".join(RAW_TRIAL_FIELDS),
         "min_rnk": 1,
         "max_rnk": max_rank,
         "fmt": "json",
     }
+
     data = request_json(CTG_LEGACY_STUDY_FIELDS_URL, session, params=params, sleep_sec=0.0)
     out: List[TrialRecord] = []
 
@@ -468,6 +506,82 @@ def ctg_fetch_studies_for_sponsor(
 
     return out
 
+    study_fields = data.get("StudyFieldsResponse", {}).get("StudyFields", [])
+    for row in study_fields:
+        def first(field: str) -> str:
+            v = row.get(field, [])
+            if isinstance(v, list):
+                return "; ".join(str(x) for x in v if x is not None)
+            return str(v or "")
+
+        out.append(
+            TrialRecord(
+                ticker="",
+                company_name="",
+                sponsor_query=sponsor_query,
+                nct_id=first("NCTId"),
+                brief_title=first("BriefTitle"),
+                condition=first("Condition"),
+                intervention_name=first("InterventionName"),
+                intervention_type=first("InterventionType"),
+                lead_sponsor_name=first("LeadSponsorName"),
+                collaborator_name=first("CollaboratorName"),
+                phase=first("Phase"),
+                overall_status=first("OverallStatus"),
+                primary_completion_date=first("PrimaryCompletionDate"),
+                completion_date=first("CompletionDate"),
+                study_first_submit_date=first("StudyFirstSubmitDate"),
+                last_update_post_date=first("LastUpdatePostDate"),
+            )
+        )
+
+    return out
+
+def token_set(text: str) -> set[str]:
+    return {t for t in normalize_name(text).split() if t}
+
+def sponsor_relevance_score(company: Company, alias: str, trial: TrialRecord) -> int:
+    company_tokens = token_set(company.company_name)
+    alias_tokens = token_set(alias)
+    sponsor_tokens = token_set(trial.lead_sponsor_name)
+    collab_tokens = token_set(trial.collaborator_name)
+
+    overlap_lead_company = len(company_tokens & sponsor_tokens)
+    overlap_lead_alias = len(alias_tokens & sponsor_tokens)
+    overlap_collab_company = len(company_tokens & collab_tokens)
+    overlap_collab_alias = len(alias_tokens & collab_tokens)
+
+    score = max(
+        overlap_lead_company * 3,
+        overlap_lead_alias * 2,
+        overlap_collab_company * 2,
+        overlap_collab_alias,
+    )
+
+    sponsor_text = f"{trial.lead_sponsor_name} {trial.collaborator_name}".lower()
+    norm_company = normalize_name(company.company_name)
+    norm_alias = normalize_name(alias)
+
+    if norm_company and norm_company in sponsor_text:
+        score += 5
+    if norm_alias and norm_alias in sponsor_text:
+        score += 3
+
+    return score
+
+def filter_trials_for_company(company: Company, alias: str, trials: List[TrialRecord]) -> List[TrialRecord]:
+    filtered = []
+    for t in trials:
+        score = sponsor_relevance_score(company, alias, t)
+        if score >= 2:
+            filtered.append(t)
+
+    # deduplicate by NCT ID
+    dedup = {}
+    for t in filtered:
+        dedup[t.nct_id or f"{t.brief_title}|{t.lead_sponsor_name}"] = t
+    return list(dedup.values())
+
 
 def choose_best_alias_trial_match(
     company: Company,
@@ -476,13 +590,18 @@ def choose_best_alias_trial_match(
 ) -> Tuple[str, List[TrialRecord]]:
     best_alias = company.company_name
     best_trials: List[TrialRecord] = []
+    best_score = -1
 
     for alias in company.aliases:
         try:
-            trials = ctg_fetch_studies_for_sponsor(alias, session, max_rank=max_trials_per_alias)
+            raw_trials = ctg_fetch_studies_for_sponsor(alias, session, max_rank=max_trials_per_alias)
+            trials = filter_trials_for_company(company, alias, raw_trials)
         except Exception:
             continue
-        if len(trials) > len(best_trials):
+
+        score = len(trials)
+        if score > best_score:
+            best_score = score
             best_alias = alias
             best_trials = trials
 
