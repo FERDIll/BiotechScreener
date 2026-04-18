@@ -6,29 +6,6 @@ biotech_screener_v1.py
 
 Excel-first biotech screener MVP.
 
-What it does
-------------
-1) Builds a public-company universe from SEC ticker data.
-2) Pulls SEC submissions metadata and XBRL company facts.
-3) Pulls ClinicalTrials.gov study data by sponsor/company name.
-4) Optionally pulls FDA Drugs@FDA approval/application data by sponsor name.
-5) Writes a real .xlsx workbook (not Notes / CSV / Apple Numbers export).
-
-Sheets written
---------------
-- Universe
-- CompanySummary
-- TrialsRaw
-- FDARaw
-- Unmatched
-- Errors
-
-Current scope
--------------
-A: Pipeline structure
-B: Catalyst proximity
-C: Financial survival
-D: Risk layer
 
 Notes
 -----
