@@ -356,6 +356,32 @@ def enrich_submissions_metadata(company: Company, session: requests.Session) -> 
         company.biotech_flag = True
         company.biotech_reason = "sic_description"
 
+    filings = data.get("filings", {}).get("recent", {})
+    forms = filings.get("form", []) or []
+    filing_dates = filings.get("filingDate", []) or []
+
+    company.facts["is_alive"] = False
+    company.facts["alive_reason"] = "no recent SEC filings"
+
+    latest_relevant_date = None
+    latest_relevant_form = ""
+    for form, filing_date in zip(forms, filing_dates):
+        if form in {"10-K", "10-Q", "20-F", "6-K", "8-K", "S-1", "F-1"}:
+            d = parse_date_safe(filing_date)
+            if d and (latest_relevant_date is None or d > latest_relevant_date):
+                latest_relevant_date = d
+                latest_relevant_form = form
+
+    if latest_relevant_date is not None:
+        age_days = (date.today() - latest_relevant_date).days
+        company.facts["latest_filing_date"] = latest_relevant_date.isoformat()
+        company.facts["latest_filing_form"] = latest_relevant_form
+        company.facts["days_since_latest_filing"] = age_days
+        if age_days <= 730:
+            company.facts["is_alive"] = True
+            company.facts["alive_reason"] = f"recent filing {latest_relevant_form} on {latest_relevant_date.isoformat()}"
+        else:
+            company.facts["alive_reason"] = f"stale filing history; last relevant filing {latest_relevant_form} on {latest_relevant_date.isoformat()}"
 
 def load_companyfacts(company: Company, session: requests.Session) -> None:
     facts_json = request_json(SEC_COMPANYFACTS_URL.format(cik=company.cik), session)
@@ -760,18 +786,34 @@ def run(args: argparse.Namespace) -> None:
     elif args.limit:
         universe = universe[: args.limit]
 
-    log("Enriching submissions metadata and biotech filter...")
+    log("Applying Gate 1 (alive) and Gate 2 (biotech)...")
     filtered: List[Company] = []
     for i, company in enumerate(universe, start=1):
         try:
             enrich_submissions_metadata(company, session)
             if company.ticker in alias_overrides:
                 company.aliases = list(dict.fromkeys(company.aliases + alias_overrides[company.ticker]))
-            if args.only_biotech:
-                if company.biotech_flag:
-                    filtered.append(company)
-            else:
-                filtered.append(company)
+
+            is_alive = bool(company.facts.get("is_alive", False))
+            if not is_alive:
+                unmatched.append({
+                    "ticker": company.ticker,
+                    "company_name": company.company_name,
+                    "reason": "gate_1_fail_not_alive",
+                    "aliases_tried": " | ".join(company.aliases),
+                })
+                continue
+
+            if not company.biotech_flag:
+                unmatched.append({
+                    "ticker": company.ticker,
+                    "company_name": company.company_name,
+                    "reason": "gate_2_fail_not_biotech",
+                    "aliases_tried": " | ".join(company.aliases),
+                })
+                continue
+
+            filtered.append(company)
         except Exception as e:
             errors.append({
                 "ticker": company.ticker,
@@ -781,10 +823,10 @@ def run(args: argparse.Namespace) -> None:
             })
 
         if i % 50 == 0:
-            log(f"  submissions processed: {i}/{len(universe)}")
+            log(f"  gate 1/2 processed: {i}/{len(universe)}")
 
     universe = filtered
-    log(f"Universe after filter: {len(universe):,}")
+    log(f"Universe after Gate 1 and Gate 2: {len(universe):,}")
 
     fda_tables: Dict[str, List[Dict[str, str]]] = {}
     if args.include_fda:
@@ -799,7 +841,7 @@ def run(args: argparse.Namespace) -> None:
     trials_raw_rows: List[Dict[str, Any]] = []
     fda_raw_rows: List[Dict[str, Any]] = []
 
-    log("Running company-level enrichment...")
+    log("Applying Gate 3 (has trial data) and running enrichment...")
     for i, company in enumerate(universe, start=1):
         try:
             load_companyfacts(company, session)
@@ -827,9 +869,10 @@ def run(args: argparse.Namespace) -> None:
             unmatched.append({
                 "ticker": company.ticker,
                 "company_name": company.company_name,
-                "reason": "no ClinicalTrials.gov studies found",
+                "reason": "gate_3_fail_no_trial_data",
                 "aliases_tried": " | ".join(company.aliases),
             })
+            continue
 
         fda_rows_for_company: List[FDARow] = []
         if fda_tables:
@@ -856,6 +899,11 @@ def run(args: argparse.Namespace) -> None:
             "sic_description": company.sic_description,
             "biotech_flag": company.biotech_flag,
             "biotech_reason": company.biotech_reason,
+            "is_alive": facts.get("is_alive"),
+            "alive_reason": facts.get("alive_reason"),
+            "latest_filing_form": facts.get("latest_filing_form"),
+            "latest_filing_date": facts.get("latest_filing_date"),
+            "days_since_latest_filing": facts.get("days_since_latest_filing"),
             "aliases": " | ".join(company.aliases),
         })
 
@@ -932,7 +980,7 @@ def run(args: argparse.Namespace) -> None:
             })
 
         if i % 10 == 0:
-            log(f"  companies processed: {i}/{len(universe)}")
+            log(f"  gate 3/enrichment processed: {i}/{len(universe)}")
 
     wb = Workbook()
 
@@ -961,7 +1009,7 @@ def run(args: argparse.Namespace) -> None:
     log(f"Saved workbook: {out_path}")
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser()() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Excel-first biotech screener MVP.")
     p.add_argument("--output", default="data/biotech_screener_v1.xlsx", help="Output .xlsx path")
     p.add_argument("--tickers", default="", help="Comma-separated ticker whitelist, e.g. MRNA,CRSP,VRTX")
