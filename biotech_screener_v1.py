@@ -8,9 +8,10 @@ What it does
 ------------
 1) Builds a public-company universe from SEC ticker data.
 2) Pulls SEC submissions metadata and XBRL company facts.
-3) Pulls ClinicalTrials.gov study data by sponsor/company name.
-4) Optionally pulls FDA Drugs@FDA approval/application data by sponsor name.
-5) Writes a real .xlsx workbook.
+3) Uses SEC-derived pipeline evidence for Gate 3.
+4) Uses asset-targeted ClinicalTrials.gov enrichment.
+5) Optionally pulls FDA Drugs@FDA approval/application data by sponsor name.
+6) Writes a real .xlsx workbook.
 
 Sheets written
 --------------
@@ -49,7 +50,7 @@ CTG_LEGACY_STUDY_FIELDS_URL = "https://clinicaltrials.gov/api/query/study_fields
 DRUGS_FDA_ZIP_URL = "https://www.fda.gov/media/89850/download"
 
 DEFAULT_HEADERS = {
-    "User-Agent": "FerdiBiotechScreener/0.1 (educational research tool; fepexa6691@mypethealh.com)",
+    "User-Agent": "FerdiBiotechScreener/0.1 (educational research tool; replace-with-your-email@example.com)",
     "Accept": "application/json, text/plain, */*",
 }
 
@@ -58,6 +59,13 @@ BIOTECH_KEYWORDS = [
     "therapeutics", "oncology", "rare disease", "clinical-stage", "clinical stage",
     "drug discovery", "pipeline", "immunotherapy", "cell therapy", "gene therapy",
     "precision medicine", "antibody", "rna", "mrna", "crispr", "small molecule",
+]
+
+PIPELINE_KEYWORDS = [
+    "clinical", "trial", "phase 1", "phase 2", "phase 3",
+    "phase i", "phase ii", "phase iii",
+    "candidate", "program", "pipeline", "investigational",
+    "ind", "nda", "bla", "drug", "therapy", "therapeutic",
 ]
 
 NAME_STOPWORDS = {
@@ -208,51 +216,15 @@ def normalize_name(name: str) -> str:
 def possible_aliases(company_name: str) -> List[str]:
     raw = company_name.strip()
     norm = normalize_name(raw)
-
     aliases = {raw}
     if norm:
         aliases.add(norm)
-
-    # remove common legal suffixes and location fragments
-    cleaned = re.sub(r"\s*/\s*[A-Z]{2,3}$", "", raw).strip()
-    cleaned = re.sub(
-        r"\b(incorporated|inc\.?|corp\.?|corporation|company|co\.?|ltd\.?|limited|plc|ag|sa|nv|se)\b",
-        "",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,/")
-    if cleaned:
-        aliases.add(cleaned)
-        aliases.add(cleaned.lower())
-
-    norm_clean = normalize_name(cleaned)
-    if norm_clean:
-        aliases.add(norm_clean)
-
-        tokens = norm_clean.split()
+        tokens = norm.split()
         if len(tokens) >= 2:
             aliases.add(" ".join(tokens[:2]))
-        if len(tokens) >= 3:
-            aliases.add(" ".join(tokens[:3]))
         if len(tokens) >= 1:
             aliases.add(tokens[0])
-
-    # a few manual-style biotech friendly variants
-    if "pharmaceuticals" in norm:
-        aliases.add(norm.replace("pharmaceuticals", "").strip())
-        aliases.add(norm.replace("pharmaceuticals", "pharma").strip())
-    if "therapeutics" in norm:
-        aliases.add(norm.replace("therapeutics", "").strip())
-    if "moderna inc" in norm or "moderna" in norm:
-        aliases.add("ModernaTX")
-        aliases.add("ModernaTX, Inc.")
-    if "vertex pharmaceuticals" in norm:
-        aliases.add("Vertex Pharmaceuticals Incorporated")
-    if "crispr therapeutics" in norm:
-        aliases.add("CRISPR Therapeutics")
-
-    return [a for a in sorted(aliases, key=len, reverse=True) if a]
+    return [a for a in aliases if a]
 
 
 def safe_float(x: Any) -> Optional[float]:
@@ -419,6 +391,71 @@ def enrich_submissions_metadata(company: Company, session: requests.Session) -> 
         else:
             company.facts["alive_reason"] = f"stale filing history; last relevant filing {latest_relevant_form} on {latest_relevant_date.isoformat()}"
 
+
+def filing_text_from_submissions(data: Dict[str, Any]) -> str:
+    bits: List[str] = []
+
+    for key in ["name", "sicDescription", "description", "stateOfIncorporationDescription"]:
+        val = data.get(key)
+        if val:
+            bits.append(str(val))
+
+    former_names = data.get("formerNames") or []
+    for item in former_names:
+        if isinstance(item, dict):
+            nm = item.get("name")
+            if nm:
+                bits.append(str(nm))
+        else:
+            bits.append(str(item))
+
+    filings = data.get("filings", {}).get("recent", {})
+    forms = filings.get("form", []) or []
+    primary_docs = filings.get("primaryDocument", []) or []
+    accession_numbers = filings.get("accessionNumber", []) or []
+
+    for form, primary_doc, accession in zip(forms[:30], primary_docs[:30], accession_numbers[:30]):
+        bits.append(f"{form} {primary_doc} {accession}")
+
+    return "\n".join(bits)
+
+
+def extract_asset_candidates_from_text(text: str) -> List[str]:
+    if not text:
+        return []
+
+    candidates = set()
+    patterns = [
+        r"\b[A-Z]{2,6}-\d{2,5}\b",   # VX-548
+        r"\b[A-Z]{3,8}\d{2,5}\b",    # CTX001
+        r"\bmRNA-\d{3,5}\b",         # mRNA-1273
+        r"\bSAR\d{3,5}\b",
+        r"\bBMS-\d{3,5}\b",
+        r"\bAZD\d{3,5}\b",
+    ]
+
+    for pattern in patterns:
+        for match in re.findall(pattern, text):
+            token = match.strip()
+            if len(token) >= 4:
+                candidates.add(token)
+
+    return sorted(candidates)
+
+
+def enrich_pipeline_evidence(company: Company, session: requests.Session) -> None:
+    data = request_json(SEC_SUBMISSIONS_URL.format(cik=company.cik), session)
+    text_blob = filing_text_from_submissions(data)
+    lower_text = text_blob.lower()
+
+    asset_candidates = extract_asset_candidates_from_text(text_blob)
+    keyword_hits = [kw for kw in PIPELINE_KEYWORDS if kw in lower_text]
+
+    company.facts["pipeline_asset_candidates"] = asset_candidates
+    company.facts["pipeline_keyword_hits"] = keyword_hits
+    company.facts["has_pipeline_evidence"] = bool(asset_candidates or keyword_hits)
+
+
 def load_companyfacts(company: Company, session: requests.Session) -> None:
     facts_json = request_json(SEC_COMPANYFACTS_URL.format(cik=company.cik), session)
     cash, cash_end, cash_form, cash_tag = first_available_fact(facts_json, XBRL_CASH_TAGS)
@@ -455,17 +492,21 @@ def load_companyfacts(company: Company, session: requests.Session) -> None:
         "net_income_tag": ni_tag,
         "estimated_annual_burn": burn_annual,
         "estimated_runway_months": runway_months,
-})
+    })
 
 
-def ctg_fetch_studies_for_sponsor(
-    sponsor_query: str,
+def ctg_fetch_studies_for_asset(
+    asset_query: str,
     session: requests.Session,
     max_rank: int = 100,
 ) -> List[TrialRecord]:
-    # Broad search first; we will post-filter in Python.
     params = {
-        "expr": sponsor_query,
+        "expr": (
+            f'AREA[InterventionName]"{asset_query}" '
+            f'OR AREA[BriefTitle]"{asset_query}" '
+            f'OR AREA[OfficialTitle]"{asset_query}" '
+            f'OR AREA[Keyword]"{asset_query}"'
+        ),
         "fields": ",".join(RAW_TRIAL_FIELDS),
         "min_rnk": 1,
         "max_rnk": max_rank,
@@ -487,7 +528,7 @@ def ctg_fetch_studies_for_sponsor(
             TrialRecord(
                 ticker="",
                 company_name="",
-                sponsor_query=sponsor_query,
+                sponsor_query=asset_query,
                 nct_id=first("NCTId"),
                 brief_title=first("BriefTitle"),
                 condition=first("Condition"),
@@ -507,79 +548,58 @@ def ctg_fetch_studies_for_sponsor(
     return out
 
 
-def token_set(text: str) -> set[str]:
-    return {t for t in normalize_name(text).split() if t}
+def filter_trials_for_asset(asset: str, trials: List[TrialRecord]) -> List[TrialRecord]:
+    asset_norm = asset.lower().replace(" ", "")
+    kept: List[TrialRecord] = []
 
-def sponsor_relevance_score(company: Company, alias: str, trial: TrialRecord) -> int:
-    company_tokens = token_set(company.company_name)
-    alias_tokens = token_set(alias)
-    sponsor_tokens = token_set(trial.lead_sponsor_name)
-    collab_tokens = token_set(trial.collaborator_name)
-
-    overlap_lead_company = len(company_tokens & sponsor_tokens)
-    overlap_lead_alias = len(alias_tokens & sponsor_tokens)
-    overlap_collab_company = len(company_tokens & collab_tokens)
-    overlap_collab_alias = len(alias_tokens & collab_tokens)
-
-    score = max(
-        overlap_lead_company * 3,
-        overlap_lead_alias * 2,
-        overlap_collab_company * 2,
-        overlap_collab_alias,
-    )
-
-    sponsor_text = f"{trial.lead_sponsor_name} {trial.collaborator_name}".lower()
-    norm_company = normalize_name(company.company_name)
-    norm_alias = normalize_name(alias)
-
-    if norm_company and norm_company in sponsor_text:
-        score += 5
-    if norm_alias and norm_alias in sponsor_text:
-        score += 3
-
-    return score
-
-def filter_trials_for_company(company: Company, alias: str, trials: List[TrialRecord]) -> List[TrialRecord]:
-    filtered = []
     for t in trials:
-        score = sponsor_relevance_score(company, alias, t)
-        if score >= 2:
-            filtered.append(t)
+        hay = " ".join([
+            t.brief_title,
+            t.intervention_name,
+            t.condition,
+            t.lead_sponsor_name,
+            t.collaborator_name,
+        ]).lower().replace(" ", "")
 
-    # deduplicate by NCT ID
-    dedup = {}
-    for t in filtered:
-        dedup[t.nct_id or f"{t.brief_title}|{t.lead_sponsor_name}"] = t
+        if asset_norm and asset_norm in hay:
+            kept.append(t)
+
+    dedup: Dict[str, TrialRecord] = {}
+    for t in kept:
+        key = t.nct_id or f"{t.brief_title}|{t.intervention_name}"
+        dedup[key] = t
+
     return list(dedup.values())
 
 
-def choose_best_alias_trial_match(
+def fetch_trials_by_assets(
     company: Company,
     session: requests.Session,
     max_trials_per_alias: int,
 ) -> Tuple[str, List[TrialRecord]]:
-    best_alias = company.company_name
+    assets = company.facts.get("pipeline_asset_candidates", []) or []
+    best_asset = ""
     best_trials: List[TrialRecord] = []
     best_score = -1
 
-    for alias in company.aliases:
+    for asset in assets[:15]:
         try:
-            raw_trials = ctg_fetch_studies_for_sponsor(alias, session, max_rank=max_trials_per_alias)
-            trials = filter_trials_for_company(company, alias, raw_trials)
+            raw_trials = ctg_fetch_studies_for_asset(asset, session, max_rank=max_trials_per_alias)
+            trials = filter_trials_for_asset(asset, raw_trials)
         except Exception:
             continue
 
         score = len(trials)
         if score > best_score:
             best_score = score
-            best_alias = alias
+            best_asset = asset
             best_trials = trials
 
     for t in best_trials:
         t.ticker = company.ticker
         t.company_name = company.company_name
 
-    return best_alias, best_trials
+    return best_asset, best_trials
 
 
 def load_drugsfda_tables(session: requests.Session) -> Dict[str, List[Dict[str, str]]]:
@@ -875,16 +895,17 @@ def run(args: argparse.Namespace) -> None:
     elif args.limit:
         universe = universe[: args.limit]
 
-    log("Applying Gate 1 (alive) and Gate 2 (biotech)...")
+    log("Applying Gate 1 (alive), Gate 2 (biotech), Gate 3 (pipeline evidence from SEC)...")
     filtered: List[Company] = []
     for i, company in enumerate(universe, start=1):
         try:
             enrich_submissions_metadata(company, session)
+            enrich_pipeline_evidence(company, session)
+
             if company.ticker in alias_overrides:
                 company.aliases = list(dict.fromkeys(company.aliases + alias_overrides[company.ticker]))
 
-            is_alive = bool(company.facts.get("is_alive", False))
-            if not is_alive:
+            if not bool(company.facts.get("is_alive", False)):
                 unmatched.append({
                     "ticker": company.ticker,
                     "company_name": company.company_name,
@@ -902,20 +923,29 @@ def run(args: argparse.Namespace) -> None:
                 })
                 continue
 
+            if not bool(company.facts.get("has_pipeline_evidence", False)):
+                unmatched.append({
+                    "ticker": company.ticker,
+                    "company_name": company.company_name,
+                    "reason": "gate_3_fail_no_pipeline_evidence",
+                    "aliases_tried": " | ".join(company.aliases),
+                })
+                continue
+
             filtered.append(company)
         except Exception as e:
             errors.append({
                 "ticker": company.ticker,
                 "company_name": company.company_name,
-                "stage": "submissions",
+                "stage": "submissions_or_pipeline",
                 "error": str(e),
             })
 
         if i % 50 == 0:
-            log(f"  gate 1/2 processed: {i}/{len(universe)}")
+            log(f"  gate 1/2/3 processed: {i}/{len(universe)}")
 
     universe = filtered
-    log(f"Universe after Gate 1 and Gate 2: {len(universe):,}")
+    log(f"Universe after Gate 1-3: {len(universe):,}")
 
     fda_tables: Dict[str, List[Dict[str, str]]] = {}
     if args.include_fda:
@@ -923,14 +953,19 @@ def run(args: argparse.Namespace) -> None:
             log("Loading Drugs@FDA tables...")
             fda_tables = load_drugsfda_tables(session)
         except Exception as e:
-            errors.append({"ticker": "", "company_name": "", "stage": "drugsfda_load", "error": str(e)})
+            errors.append({
+                "ticker": "",
+                "company_name": "",
+                "stage": "drugsfda_load",
+                "error": str(e),
+            })
 
     summary_rows: List[Dict[str, Any]] = []
     universe_rows: List[Dict[str, Any]] = []
     trials_raw_rows: List[Dict[str, Any]] = []
     fda_raw_rows: List[Dict[str, Any]] = []
 
-    log("Applying Gate 3 (has trial data) and running enrichment...")
+    log("Running enrichment with asset-targeted ClinicalTrials.gov lookups...")
     for i, company in enumerate(universe, start=1):
         try:
             load_companyfacts(company, session)
@@ -942,26 +977,28 @@ def run(args: argparse.Namespace) -> None:
                 "error": str(e),
             })
 
-        matched_alias = ""
+        matched_asset = ""
         trial_records: List[TrialRecord] = []
         try:
-            matched_alias, trial_records = choose_best_alias_trial_match(company, session, args.max_trials_per_alias)
+            matched_asset, trial_records = fetch_trials_by_assets(company, session, args.max_trials_per_alias)
         except Exception as e:
             errors.append({
                 "ticker": company.ticker,
                 "company_name": company.company_name,
-                "stage": "clinicaltrials",
+                "stage": "clinicaltrials_asset_lookup",
                 "error": str(e),
             })
+
+        ctgov_match_found = bool(trial_records)
+        ctgov_match_confidence = "high" if trial_records else "low"
 
         if not trial_records:
             unmatched.append({
                 "ticker": company.ticker,
                 "company_name": company.company_name,
-                "reason": "gate_3_fail_no_trial_data",
-                "aliases_tried": " | ".join(company.aliases),
+                "reason": "trial_enrichment_failed_no_asset_match",
+                "aliases_tried": " | ".join(company.facts.get("pipeline_asset_candidates", [])),
             })
-            continue
 
         fda_rows_for_company: List[FDARow] = []
         if fda_tables:
@@ -993,13 +1030,18 @@ def run(args: argparse.Namespace) -> None:
             "latest_filing_form": facts.get("latest_filing_form"),
             "latest_filing_date": facts.get("latest_filing_date"),
             "days_since_latest_filing": facts.get("days_since_latest_filing"),
+            "has_pipeline_evidence": facts.get("has_pipeline_evidence"),
+            "pipeline_keyword_hits": " | ".join(facts.get("pipeline_keyword_hits", [])),
+            "pipeline_asset_candidates": " | ".join(facts.get("pipeline_asset_candidates", [])),
             "aliases": " | ".join(company.aliases),
         })
 
         summary_rows.append({
             "ticker": company.ticker,
             "company_name": company.company_name,
-            "matched_sponsor_alias": matched_alias,
+            "matched_asset": matched_asset,
+            "ctgov_match_found": ctgov_match_found,
+            "ctgov_match_confidence": ctgov_match_confidence,
             "study_count": trial_summary["study_count"],
             "unique_assets": trial_summary["unique_assets"],
             "highest_phase": trial_summary["highest_phase"],
@@ -1069,7 +1111,7 @@ def run(args: argparse.Namespace) -> None:
             })
 
         if i % 10 == 0:
-            log(f"  gate 3/enrichment processed: {i}/{len(universe)}")
+            log(f"  enrichment processed: {i}/{len(universe)}")
 
     wb = Workbook()
 
@@ -1103,7 +1145,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", default="data/biotech_screener_v1.xlsx", help="Output .xlsx path")
     p.add_argument("--tickers", default="", help="Comma-separated ticker whitelist, e.g. MRNA,CRSP,VRTX")
     p.add_argument("--limit", type=int, default=0, help="Limit the SEC universe before filtering")
-    p.add_argument("--max-trials-per-alias", type=int, default=100, help="Max CT.gov trials to fetch per alias")
+    p.add_argument("--max-trials-per-alias", type=int, default=100, help="Max CT.gov trials to fetch per asset query")
     p.add_argument("--include-fda", action="store_true", help="Include Drugs@FDA sponsor matching")
     p.add_argument("--alias-overrides", default="", help="CSV file with manual ticker->alias overrides")
     return p
